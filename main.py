@@ -358,9 +358,11 @@ async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks, 
     user = get_or_create_user(from_number, db)
     
     resp = MessagingResponse()
+    resp.message(f"Debug:\nMedia URL: {media_url}\nMedia Type: {media_type}")
     
     # Check if message contains /Chitrify command and image
     if "/chitrify" in message_body.lower() and media_url:
+        logger.info(f"Incoming from {from_number}: Body={message_body}, MediaUrl={media_url}, MediaType={media_type}")
         # Download and validate image
         try:
             media_response = requests.get(media_url)
