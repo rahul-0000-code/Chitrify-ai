@@ -8,7 +8,7 @@ from typing import Optional, List, Dict, Any
 from enum import Enum
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Depends, File, UploadFile, Form, Request, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Depends, File, Response, UploadFile, Form, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -16,8 +16,6 @@ from sqlalchemy import create_engine, Column, String, DateTime, Float, Integer, 
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
 from sqlalchemy.sql import func
-import stripe
-import razorpay
 from twilio.rest import Client
 from twilio.twiml.messaging_response import MessagingResponse
 import redis
@@ -29,7 +27,6 @@ from PIL import Image
 import io
 import boto3
 from dotenv import load_dotenv
-from fastapi.responses import Response
 import httpx
 
 # Load environment variables
@@ -68,20 +65,23 @@ celery_app = Celery(
 
 # External service clients
 twilio_client = Client(os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN"))
-stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
-razorpay_client = razorpay.Client(
-    auth=(os.getenv("RAZORPAY_KEY_ID"), os.getenv("RAZORPAY_KEY_SECRET"))
-)
 posthog.api_key = os.getenv("POSTHOG_API_KEY")
 posthog.host = os.getenv("POSTHOG_HOST", "https://app.posthog.com")
 
-# AWS S3 setup
-s3_client = boto3.client(
-    's3',
-    aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-    aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
-)
-AWS_BUCKET_NAME = os.getenv("AWS_BUCKET_NAME")
+# AWS S3 setup (optional - will fallback to local storage)
+try:
+    s3_client = boto3.client(
+        's3',
+        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+    )
+    AWS_BUCKET_NAME = os.getenv("AWS_BUCKET_NAME")
+    USE_S3 = AWS_BUCKET_NAME is not None
+except:
+    s3_client = None
+    AWS_BUCKET_NAME = None
+    USE_S3 = False
+    logger.info("S3 not configured, will use local storage")
 
 # Enums and Constants
 class ImageStyle(str, Enum):
@@ -113,10 +113,8 @@ STYLE_DESCRIPTIONS = {
     ImageStyle.WATERCOLOR: "🖌️ Water-colour Sketch"
 }
 
-PRICING = {
-    "US": {"single": 1.00, "pack": 8.00},
-    "IN": {"single": 19.0, "pack": 149.0}
-}
+# For testing - all processing is free
+FREE_PROCESSING = True
 
 # Database Models
 class User(Base):
@@ -223,15 +221,28 @@ def get_or_create_user(whatsapp_number: str, db: Session) -> User:
     return user
 
 def upload_to_s3(file_content: bytes, filename: str) -> str:
-    """Upload file to S3 and return URL"""
-    key = f"images/{datetime.utcnow().strftime('%Y/%m/%d')}/{filename}"
-    s3_client.put_object(
-        Bucket=AWS_BUCKET_NAME,
-        Key=key,
-        Body=file_content,
-        ContentType='image/jpeg'
-    )
-    return f"https://{AWS_BUCKET_NAME}.s3.amazonaws.com/{key}"
+    """Upload file to S3 or save locally for testing"""
+    if USE_S3 and s3_client:
+        try:
+            key = f"images/{datetime.utcnow().strftime('%Y/%m/%d')}/{filename}"
+            s3_client.put_object(
+                Bucket=AWS_BUCKET_NAME,
+                Key=key,
+                Body=file_content,
+                ContentType='image/jpeg'
+            )
+            return f"https://{AWS_BUCKET_NAME}.s3.amazonaws.com/{key}"
+        except:
+            logger.error("S3 upload failed, using local storage")
+    
+    # Fallback to local storage for testing
+    os.makedirs("uploads", exist_ok=True)
+    local_path = f"uploads/{filename}"
+    with open(local_path, "wb") as f:
+        f.write(file_content)
+    
+    # Return a local URL (you'll need to serve this statically in production)
+    return f"{os.getenv('WEBHOOK_BASE_URL', 'http://localhost:8000')}/uploads/{filename}"
 
 def send_whatsapp_message(to: str, message: str, media_url: str = None):
     """Send WhatsApp message via Twilio"""
@@ -304,10 +315,10 @@ def process_image_render(render_id: str):
         render.error_message = str(e)
         db.commit()
         
-        # Refund if payment was made
-        if render.order_id:
-            # Implement refund logic here
-            pass
+        # Refund if payment was made (not applicable in free mode)
+        # if render.order_id:
+        #     # Implement refund logic here
+        #     pass
         
         # Notify user
         send_whatsapp_message(
@@ -321,22 +332,39 @@ def process_image_render(render_id: str):
         db.close()
 
 def process_with_ai_model(image_content: bytes, style: str) -> bytes:
-    """Process image with AI model - replace with your preferred AI service"""
-    # Example using Replicate API
-    # You can replace this with Stability AI, OpenAI DALL-E, or local models
-    
-    # For POC, returning original image with a simple filter
-    # In production, integrate with actual AI services
-    img = Image.open(io.BytesIO(image_content))
-    
-    # Apply simple processing based on style (for demo)
-    if style == ImageStyle.CARTOON_3D:
-        # Placeholder processing
-        img = img.convert('RGB')
-    
-    output = io.BytesIO()
-    img.save(output, format='JPEG', quality=85)
-    return output.getvalue()
+    """Process image with AI model - simplified for testing"""
+    # For testing, just return a processed version (add a watermark or simple effect)
+    try:
+        img = Image.open(io.BytesIO(image_content))
+        
+        # Simple processing based on style (for demo)
+        if style == ImageStyle.CARTOON_3D:
+            # Convert to RGB and resize for demo
+            img = img.convert('RGB')
+            img = img.resize((min(800, img.width), min(800, img.height)))
+        elif style == ImageStyle.OIL_PAINT:
+            # Apply a simple filter effect
+            img = img.convert('RGB')
+        
+        # Add a simple watermark for testing
+        from PIL import ImageDraw, ImageFont
+        draw = ImageDraw.Draw(img)
+        
+        # Try to add text watermark
+        try:
+            # Use default font
+            draw.text((10, 10), f"Chitrify AI - {style}", fill="white")
+        except:
+            pass  # Skip if font issues
+        
+        output = io.BytesIO()
+        img.save(output, format='JPEG', quality=85)
+        return output.getvalue()
+        
+    except Exception as e:
+        logger.error(f"Image processing error: {e}")
+        # Return original image if processing fails
+        return image_content
 
 # API Routes
 @app.post("/webhook/whatsapp")
@@ -396,15 +424,7 @@ async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks, 
             for i, (style, desc) in enumerate(STYLE_DESCRIPTIONS.items(), 1):
                 styles_text += f"{i}️⃣ {desc}\n"
             
-            pricing = PRICING[user.country_code]
-            currency = "₹" if user.country_code == "IN" else "$"
-            
-            styles_text += f"\n💰 Price: {currency}{pricing['single']} per image"
-            styles_text += f"\n🎁 Pack of 10: {currency}{pricing['pack']}"
-            
-            if user.free_credits > 0:
-                styles_text += f"\n✨ You have {user.free_credits} free credits!"
-            
+            styles_text += f"\n🎉 FREE TESTING MODE - All styles are free!"
             styles_text += "\n\nReply with the number (1-6) to continue."
             
             # Store image URL in Redis for this user
@@ -417,7 +437,7 @@ async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks, 
             resp.message("Sorry, there was an error processing your image. Please try again.")
     
     elif message_body.isdigit() and 1 <= int(message_body) <= 6:
-        # Handle style selection
+        # Handle style selection - process immediately without payment
         style_mapping = list(ImageStyle)
         selected_style = style_mapping[int(message_body) - 1]
         
@@ -429,58 +449,22 @@ async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks, 
         
         pending_image_url = pending_image_url.decode()
         
-        # Check if user has free credits
-        if user.free_credits > 0:
-            # Process immediately with free credit
-            user.free_credits -= 1
-            db.commit()
-            
-            render = ImageRender(
-                user_id=user.id,
-                original_image_url=pending_image_url,
-                style=selected_style
-            )
-            db.add(render)
-            db.commit()
-            
-            # Queue processing
-            process_image_render.delay(render.id)
-            
-            resp.message(f"🎉 Using your free credit! Processing your {STYLE_DESCRIPTIONS[selected_style]}. This usually takes under 60 seconds.")
-            
-        else:
-            # Create payment links
-            pricing = PRICING[user.country_code]
-            
-            if user.country_code == "IN":
-                # Create Razorpay payment link
-                payment_data = {
-                    "amount": int(pricing["single"] * 100),  # Razorpay uses paisa
-                    "currency": "INR",
-                    "description": f"Chitrify - {STYLE_DESCRIPTIONS[selected_style]}",
-                    "customer": {
-                        "contact": user.whatsapp_number.replace("whatsapp:", "")
-                    }
-                }
-                
-                # Store payment intent
-                redis_client.setex(
-                    f"payment_intent:{user.id}",
-                    600,  # 10 min expiry
-                    json.dumps({
-                        "style": selected_style,
-                        "image_url": pending_image_url,
-                        "amount": pricing["single"]
-                    })
-                )
-                
-                payment_url = f"{os.getenv('WEBHOOK_BASE_URL')}/payment/razorpay?user_id={user.id}"
-                
-            else:
-                # Create Stripe payment link
-                payment_url = f"{os.getenv('WEBHOOK_BASE_URL')}/payment/stripe?user_id={user.id}"
-            
-            resp.message(f"💳 Pay {PRICING[user.country_code]['single']} to process your {STYLE_DESCRIPTIONS[selected_style]}\n\n🔗 {payment_url}")
+        # Process immediately (free for testing)
+        render = ImageRender(
+            user_id=user.id,
+            original_image_url=pending_image_url,
+            style=selected_style
+        )
+        db.add(render)
+        db.commit()
+        
+        # Queue processing
+        process_image_render.delay(render.id)
+        
+        resp.message(f"🎉 Processing your {STYLE_DESCRIPTIONS[selected_style]} for FREE! This usually takes under 60 seconds.")
+        
+        # Clean up pending image
+        redis_client.delete(f"pending_image:{user.id}")
     
     else:
         # Default help message
@@ -502,113 +486,7 @@ Try it now: Send a photo with /Chitrify"""
         
         resp.message(help_text)
     
-    # return str(resp)
     return Response(str(resp), media_type="application/xml")
-
-
-@app.get("/payment/stripe")
-async def stripe_payment(user_id: str, db: Session = Depends(get_db)):
-    """Create Stripe payment session"""
-    user = db.query(User).filter(User.id == user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    
-    payment_intent_data = redis_client.get(f"payment_intent:{user_id}")
-    if not payment_intent_data:
-        raise HTTPException(status_code=400, detail="Payment intent expired")
-    
-    intent_data = json.loads(payment_intent_data)
-    
-    try:
-        session = stripe.checkout.Session.create(
-            payment_method_types=['card'],
-            line_items=[{
-                'price_data': {
-                    'currency': 'usd',
-                    'product_data': {
-                        'name': f"Chitrify - {STYLE_DESCRIPTIONS[intent_data['style']]}",
-                    },
-                    'unit_amount': int(intent_data['amount'] * 100),
-                },
-                'quantity': 1,
-            }],
-            mode='payment',
-            success_url=f"{os.getenv('WEBHOOK_BASE_URL')}/payment/success?session_id={{CHECKOUT_SESSION_ID}}",
-            cancel_url=f"{os.getenv('WEBHOOK_BASE_URL')}/payment/cancel",
-            metadata={
-                'user_id': user_id,
-                'style': intent_data['style'],
-                'image_url': intent_data['image_url']
-            }
-        )
-        
-        return {"url": session.url}
-    
-    except Exception as e:
-        logger.error(f"Stripe payment creation failed: {e}")
-        raise HTTPException(status_code=500, detail="Payment creation failed")
-
-@app.post("/webhook/stripe")
-async def stripe_webhook(request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    """Handle Stripe webhooks"""
-    payload = await request.body()
-    
-    try:
-        event = stripe.Event.construct_from(
-            json.loads(payload), stripe.api_key
-        )
-        
-        if event['type'] == 'checkout.session.completed':
-            session = event['data']['object']
-            user_id = session['metadata']['user_id']
-            style = session['metadata']['style']
-            image_url = session['metadata']['image_url']
-            
-            user = db.query(User).filter(User.id == user_id).first()
-            if user:
-                # Create order
-                order = Order(
-                    user_id=user_id,
-                    amount=session['amount_total'] / 100,
-                    currency=session['currency'].upper(),
-                    payment_status=PaymentStatus.COMPLETED,
-                    payment_gateway="stripe",
-                    gateway_payment_id=session['id']
-                )
-                db.add(order)
-                db.commit()
-                
-                # Create render
-                render = ImageRender(
-                    user_id=user_id,
-                    order_id=order.id,
-                    original_image_url=image_url,
-                    style=style
-                )
-                db.add(render)
-                db.commit()
-                
-                # Queue processing
-                process_image_render.delay(render.id)
-                
-                # Track payment
-                posthog.capture(user_id, 'paid', {
-                    'amount': order.amount,
-                    'currency': order.currency,
-                    'gateway': 'stripe'
-                })
-                
-                # Notify user
-                send_whatsapp_message(
-                    user.whatsapp_number,
-                    f"✅ Payment confirmed! Processing your {STYLE_DESCRIPTIONS[style]}. This usually takes under 60 seconds."
-                )
-        
-        return {"status": "success"}
-    
-    except Exception as e:
-        logger.error(f"Stripe webhook error: {e}")
-        return {"status": "error"}
 
 @app.get("/health")
 async def health_check():
@@ -626,8 +504,14 @@ async def get_stats(db: Session = Depends(get_db)):
         "total_users": total_users,
         "total_renders": total_renders,
         "completed_renders": completed_renders,
-        "success_rate": completed_renders / total_renders if total_renders > 0 else 0
+        "success_rate": completed_renders / total_renders if total_renders > 0 else 0,
+        "mode": "FREE_TESTING"
     }
+
+from fastapi.staticfiles import StaticFiles
+if not USE_S3:
+    os.makedirs("uploads", exist_ok=True)
+    app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
