@@ -1,0 +1,103 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://chitrify:password@db:5432/chitrify
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - db
+      - redis
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: chitrify
+      POSTGRES_USER: chitrify
+      POSTGRES_PASSWORD: password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  celery-worker:
+    build: .
+    command: celery -A main.celery_app worker --loglevel=info
+    depends_on:
+      - db
+      - redis
+    environment:
+      - DATABASE_URL=postgresql://chitrify:password@db:5432/chitrify
+      - REDIS_URL=redis://redis:6379
+    env_file:
+      - .env
+
+  celery-beat:
+    build: .
+    command: celery -A main.celery_app beat --loglevel=info
+    depends_on:
+      - db
+      - redis
+    environment:
+      - DATABASE_URL=postgresql://chitrify:password@db:5432/chitrify
+      - REDIS_URL=redis://redis:6379
+    env_file:
+      - .env
+
+volumes:
+  postgres_data:
+
+---
+
+# # railway.toml (for Railway deployment)
+# [build]
+# builder = "dockerfile"
+
+# [deploy]
+# startCommand = "uvicorn main:app --host 0.0.0.0 --port $PORT"
+# healthcheckPath = "/health"
+# restartPolicyType = "on_failure"
+
+---
+
+# # render.yaml (for Render deployment)
+# services:
+#   - type: web
+#     name: chitrify-api
+#     env: python
+#     buildCommand: pip install -r requirements.txt
+#     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+#     healthCheckPath: /health
+#     envVars:
+#       - key: PYTHON_VERSION
+#         value: 3.11.0
+
+#   - type: worker
+#     name: chitrify-worker
+#     env: python
+#     buildCommand: pip install -r requirements.txt
+#     startCommand: celery -A main.celery_app worker --loglevel=info
+
+#   - type: redis
+#     name: chitrify-redis
+#     ipAllowList: []
+
+# databases:
+#   - name: chitrify-db
+#     databaseName: chitrify
+#     user: chitrify
+
+# ---
+
