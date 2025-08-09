@@ -19,9 +19,6 @@ from sqlalchemy.dialects.postgresql import UUID, ENUM
 from twilio.rest import Client
 from twilio.twiml.messaging_response import MessagingResponse
 from PIL import ImageDraw
-
-import redis
-from celery import Celery
 import requests
 from PIL import Image
 import io
@@ -58,15 +55,6 @@ engine = create_engine(
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# Redis setup
-redis_client = redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379"))
-
-# Celery setup
-celery_app = Celery(
-    "chitrify",
-    broker=os.getenv("REDIS_URL", "redis://localhost:6379"),
-    backend=os.getenv("REDIS_URL", "redis://localhost:6379")
-)
 
 GEMINI_API_KEY = os.getenv("GOOGLE_GEMINI_API_KEY")
 if GEMINI_API_KEY:
@@ -128,8 +116,10 @@ STYLE_DESCRIPTIONS = {
     ImageStyle.WATERCOLOR: "🖌️ Water-colour Sketch"
 }
 
+
 # For testing - all processing is free
 FREE_PROCESSING = True
+
 
 # Enhanced style prompts for Gemini
 STYLE_PROMPTS = {
@@ -147,7 +137,7 @@ class User(Base):
     __tablename__ = "users"
     
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    whatsapp_number = Column(String(20), unique=True, index=True, nullable=False)
+    whatsapp_number = Column(String(50), unique=True, index=True, nullable=False)  # ✅ Increased from 20 to 50
     country_code = Column(String(3), default="US")
     free_credits = Column(Integer, default=0)
     total_referrals = Column(Integer, default=0)
@@ -169,7 +159,8 @@ class Order(Base):
     created_at = Column(DateTime(timezone=True), default=func.now(), index=True)
     
     user = relationship("User", back_populates="orders")
-    renders = relationship("ImageRender", back_populates="order")
+    renders = relationship("ImageRender", back_populates="order")  # ✅ Fixed this line
+
 
 class ImageRender(Base):
     __tablename__ = "image_renders"
@@ -186,17 +177,12 @@ class ImageRender(Base):
     completed_at = Column(DateTime(timezone=True), nullable=True)
     expires_at = Column(DateTime(timezone=True), default=lambda: datetime.utcnow() + timedelta(days=30), index=True)
     
-    user = relationship("User", back_populates="renders")
-    order = relationship("Order", back_populates="renders")
-
-class Referral(Base):
-    __tablename__ = "referrals"
+    # Store pending image data directly in DB for simplicity
+    pending_image_data = Column(Text, nullable=True)  # base64 encoded image for pending renders
     
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    referrer_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), index=True)
-    referee_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), index=True)
-    completed = Column(Boolean, default=False, index=True)
-    created_at = Column(DateTime(timezone=True), default=func.now(), index=True)
+    user = relationship("User", back_populates="renders")
+    order = relationship("Order", back_populates="renders")  # This is correct
+
 
 # Create ENUM types first, then tables
 def create_enums_and_tables():
@@ -211,7 +197,9 @@ def create_enums_and_tables():
     # Create tables
     Base.metadata.create_all(bind=engine)
 
+
 create_enums_and_tables()
+
 
 # Dependency to get DB session
 def get_db():
@@ -221,6 +209,7 @@ def get_db():
     finally:
         db.close()
 
+
 # Pydantic models
 class WhatsAppMessage(BaseModel):
     From: str
@@ -229,15 +218,18 @@ class WhatsAppMessage(BaseModel):
     MediaUrl0: Optional[str] = None
     MediaContentType0: Optional[str] = None
 
+
 class StyleSelection(BaseModel):
     style: ImageStyle
     whatsapp_number: str
+
 
 class PaymentRequest(BaseModel):
     amount: float
     currency: str
     whatsapp_number: str
     style: ImageStyle
+
 
 # Utility functions
 def get_or_create_user(whatsapp_number: str, db: Session) -> User:
@@ -251,6 +243,7 @@ def get_or_create_user(whatsapp_number: str, db: Session) -> User:
         db.refresh(user)
         
     return user
+
 
 def upload_to_s3(file_content: bytes, filename: str) -> str:
     """Upload file to S3 or save locally for testing"""
@@ -276,6 +269,7 @@ def upload_to_s3(file_content: bytes, filename: str) -> str:
     # Return a local URL (you'll need to serve this statically in production)
     return f"{os.getenv('WEBHOOK_BASE_URL', 'http://localhost:8000')}/uploads/{filename}"
 
+
 def send_whatsapp_message(to: str, message: str, media_url: str = None):
     """Send WhatsApp message via Twilio"""
     try:
@@ -291,6 +285,7 @@ def send_whatsapp_message(to: str, message: str, media_url: str = None):
     except Exception as e:
         logger.error(f"Failed to send WhatsApp message: {e}")
 
+
 def is_safe_content(image_content: bytes) -> bool:
     """Basic content safety check - you can integrate with AWS Rekognition or similar"""
     # For POC, just check file size and basic image validation
@@ -300,11 +295,10 @@ def is_safe_content(image_content: bytes) -> bool:
     except:
         return False
 
-# Celery tasks
-@celery_app.task
-def process_image_render(render_id: str):
-    """Process image rendering using AI model"""
-    db = SessionLocal()
+
+# Synchronous image processing function
+def process_image_render(render_id: str, db: Session):
+    """Process image rendering using AI model synchronously"""
     try:
         render = db.query(ImageRender).filter(ImageRender.id == render_id).first()
         if not render:
@@ -318,8 +312,7 @@ def process_image_render(render_id: str):
         if response.status_code != 200:
             raise Exception("Failed to download original image")
         
-        # Process with AI model (using Replicate as example)
-        # You can replace this with any AI service
+        # Process with AI model
         processed_image = process_with_ai_model(response.content, render.style)
         
         # Upload processed image
@@ -341,11 +334,6 @@ def process_image_render(render_id: str):
         render.error_message = str(e)
         db.commit()
         
-        # Refund if payment was made (not applicable in free mode)
-        # if render.order_id:
-        #     # Implement refund logic here
-        #     pass
-        
         # Notify user
         send_whatsapp_message(
             render.user.whatsapp_number,
@@ -353,9 +341,7 @@ def process_image_render(render_id: str):
         )
         
         logger.error(f"Image processing failed for {render_id}: {e}")
-    
-    finally:
-        db.close()
+
 
 def process_with_ai_model(image_content: bytes, style: ImageStyle) -> bytes:
     """Process image with Google Gemini AI model"""
@@ -417,22 +403,16 @@ def enhanced_image_processing(image_content: bytes, style: ImageStyle, ai_analys
         
         # Apply style-specific transformations
         if style == ImageStyle.CARTOON_3D:
-            # Enhanced cartoon processing
             img = apply_cartoon_effect(img)
         elif style == ImageStyle.OIL_PAINT:
-            # Enhanced oil paint effect
             img = apply_oil_paint_effect(img)
         elif style == ImageStyle.ANIME_90S:
-            # Enhanced anime effect
             img = apply_anime_effect(img)
         elif style == ImageStyle.WATERCOLOR:
-            # Enhanced watercolor effect
             img = apply_watercolor_effect(img)
         elif style == ImageStyle.VINTAGE_COLORIZED:
-            # Enhanced vintage effect
             img = apply_vintage_effect(img)
         elif style == ImageStyle.ROTOSCOPE:
-            # Enhanced rotoscope effect
             img = apply_rotoscope_effect(img)
         
         # Add style-specific watermark
@@ -450,8 +430,6 @@ def enhanced_image_processing(image_content: bytes, style: ImageStyle, ai_analys
 
 def apply_cartoon_effect(img: Image.Image) -> Image.Image:
     """Apply 3D cartoon-like effect"""
-    
-    
     # Enhance colors and contrast
     enhancer = ImageEnhance.Color(img)
     img = enhancer.enhance(1.3)
@@ -479,7 +457,6 @@ def apply_oil_paint_effect(img: Image.Image) -> Image.Image:
 
 def apply_anime_effect(img: Image.Image) -> Image.Image:
     """Apply anime-style effect"""
-    
     # Increase saturation for vibrant anime colors
     enhancer = ImageEnhance.Color(img)
     img = enhancer.enhance(1.4)
@@ -530,7 +507,6 @@ def apply_rotoscope_effect(img: Image.Image) -> Image.Image:
 
 def add_style_watermark(img: Image.Image, style: ImageStyle) -> Image.Image:
     """Add style-specific watermark"""
-    
     draw = ImageDraw.Draw(img)
     
     # Style-specific watermark text
@@ -559,7 +535,16 @@ def fallback_image_processing(image_content: bytes, style: ImageStyle) -> bytes:
         # Apply basic style transformation
         if style == ImageStyle.CARTOON_3D:
             img = apply_cartoon_effect(img)
-        # ... other styles
+        elif style == ImageStyle.OIL_PAINT:
+            img = apply_oil_paint_effect(img)
+        elif style == ImageStyle.ANIME_90S:
+            img = apply_anime_effect(img)
+        elif style == ImageStyle.WATERCOLOR:
+            img = apply_watercolor_effect(img)
+        elif style == ImageStyle.VINTAGE_COLORIZED:
+            img = apply_vintage_effect(img)
+        elif style == ImageStyle.ROTOSCOPE:
+            img = apply_rotoscope_effect(img)
         
         # Add basic watermark
         img = add_style_watermark(img, style)
@@ -572,6 +557,13 @@ def fallback_image_processing(image_content: bytes, style: ImageStyle) -> bytes:
         logger.error(f"Fallback processing failed: {e}")
         # Return original image as last resort
         return image_content
+
+
+# Background task function for processing
+async def process_image_background(render_id: str, db: Session):
+    """Background processing function"""
+    process_image_render(render_id, db)
+
 
 # API Routes
 @app.post("/webhook/whatsapp")
@@ -587,7 +579,6 @@ async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks, 
     user = get_or_create_user(from_number, db)
     
     resp = MessagingResponse()
-    resp.message(f"Debug:\nMedia URL: {media_url}\nMedia Type: {media_type}")
     
     # Check if message contains /Chitrify command and image
     if "/chitrify" in message_body.lower() and media_url:
@@ -622,8 +613,23 @@ async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks, 
             styles_text += "\n🎉 FREE TESTING MODE - All styles are free!"
             styles_text += "\n\nReply with the number (1-6) to continue."
             
-            # Store image URL in Redis for this user
-            redis_client.setex(f"pending_image:{user.id}", 300, original_url)  # 5 min expiry
+            # Store pending render in database
+            pending_render = ImageRender(
+                user_id=user.id,
+                original_image_url=original_url,
+                style=ImageStyle.CARTOON_3D,  # Placeholder, will be updated
+                status=RenderStatus.QUEUED
+            )
+            db.add(pending_render)
+            db.commit()
+            
+            # Store the pending render ID for this user (clean up old ones first)
+            db.query(ImageRender).filter(
+                ImageRender.user_id == user.id,
+                ImageRender.status == RenderStatus.QUEUED,
+                ImageRender.id != pending_render.id
+            ).delete()
+            db.commit()
             
             resp.message(styles_text)
             
@@ -636,30 +642,24 @@ async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks, 
         style_mapping = list(ImageStyle)
         selected_style = style_mapping[int(message_body) - 1]
         
-        # Check if user has pending image
-        pending_image_url = redis_client.get(f"pending_image:{user.id}")
-        if not pending_image_url:
+        # Get the pending render for this user
+        pending_render = db.query(ImageRender).filter(
+            ImageRender.user_id == user.id,
+            ImageRender.status == RenderStatus.QUEUED
+        ).first()
+        
+        if not pending_render:
             resp.message("No pending image found. Please send a photo with /Chitrify command first.")
             return str(resp)
         
-        pending_image_url = pending_image_url.decode()
-        
-        # Process immediately (free for testing)
-        render = ImageRender(
-            user_id=user.id,
-            original_image_url=pending_image_url,
-            style=selected_style
-        )
-        db.add(render)
+        # Update the render with selected style
+        pending_render.style = selected_style
         db.commit()
         
-        # Queue processing
-        process_image_render.delay(str(render.id))
+        # Process in background using FastAPI BackgroundTasks
+        background_tasks.add_task(process_image_background, str(pending_render.id), db)
         
         resp.message(f"🎉 Processing your {STYLE_DESCRIPTIONS[selected_style]} for FREE! This usually takes under 60 seconds.")
-        
-        # Clean up pending image
-        redis_client.delete(f"pending_image:{user.id}")
     
     else:
         # Default help message
@@ -683,10 +683,12 @@ Try it now: Send a photo with /Chitrify"""
     
     return Response(str(resp), media_type="application/xml")
 
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
     return {"status": "healthy", "timestamp": datetime.utcnow()}
+
 
 @app.get("/stats")
 async def get_stats(db: Session = Depends(get_db)):
@@ -703,9 +705,11 @@ async def get_stats(db: Session = Depends(get_db)):
         "mode": "FREE_TESTING"
     }
 
+
 if not USE_S3:
     os.makedirs("uploads", exist_ok=True)
     app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
