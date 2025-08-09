@@ -1,6 +1,7 @@
 __pycache__/
 .venv/
 venv/
+chitrify/
 *.py[cod]
 *$py.class
 *.so
