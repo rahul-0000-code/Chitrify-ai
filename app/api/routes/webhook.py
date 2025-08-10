@@ -157,7 +157,7 @@ This is needed for our testing environment. Full version won't need this! 🚀""
                 resp.message("❌ Error processing your image URL. Please try again or use a different link.")
                 return Response(str(resp), media_type="application/xml")
         
-        # Handle style selection
+        # Handle style selection - ✅ UPDATED METHOD
         elif message_body.isdigit() and 1 <= int(message_body) <= 6:
             style_mapping = [
                 ImageStyle.CARTOON_3D,
@@ -182,36 +182,101 @@ This is needed for our testing environment. Full version won't need this! 🚀""
             pending_render.style = selected_style
             db.commit()
             
-            # Get original image data for processing
+            # ✅ PROCESS SYNCHRONOUSLY - SAME METHOD AS OTHER MESSAGES
             try:
                 original_image_data = download_image_from_url(pending_render.original_image_url)
                 if not original_image_data:
                     raise Exception("Unable to obtain original image data")
                 
-                background_tasks.add_task(
-                    process_image_background, 
-                    str(pending_render.id), 
-                    original_image_data
-                )
+                logger.info(f"Starting image processing for style: {selected_style}")
                 
+                # Update status to processing
+                pending_render.status = RenderStatus.PROCESSING
+                db.commit()
+                
+                # Process image
+                processed_image = await image_processor.process_image(original_image_data, selected_style)
+                
+                if not processed_image:
+                    raise Exception("Image processing failed")
+                
+                # Upload processed image
+                filename = f"chitrify_{selected_style}_{str(pending_render.id)[:8]}.jpg"
+                rendered_url = await image_processor.upload_image(processed_image, filename)
+                
+                if not rendered_url:
+                    raise Exception("Failed to upload processed image")
+                
+                # Update render record
+                pending_render.rendered_image_url = rendered_url
+                pending_render.status = RenderStatus.COMPLETED
+                db.commit()
+                
+                # Style names for user-friendly messages
                 style_names = {
-                    ImageStyle.CARTOON_3D: "Studio Ghibli style",
-                    ImageStyle.OIL_PAINT: "Oil Painting", 
-                    ImageStyle.ROTOSCOPE: "Rotoscope Animation",
-                    ImageStyle.ANIME_90S: "90s Anime",
-                    ImageStyle.VINTAGE_COLORIZED: "Vintage Photo",
+                    ImageStyle.CARTOON_3D: "Studio Ghibli Animation",
+                    ImageStyle.OIL_PAINT: "Renaissance Oil Painting", 
+                    ImageStyle.ROTOSCOPE: "Rotoscope Movie Effect",
+                    ImageStyle.ANIME_90S: "Classic 90s Anime",
+                    ImageStyle.VINTAGE_COLORIZED: "Vintage Photograph",
                     ImageStyle.WATERCOLOR: "Watercolor Painting"
                 }
                 
-                resp.message(f"🎨 **Creating your {style_names[selected_style]}...**\n\n⏱️ Processing time: ~30-60 seconds\n✨ Your transformed image will arrive shortly!")
+                # ✅ USE SAME METHOD AS ALL OTHER MESSAGES
+                final_message = f"""🎉 **Your {style_names[selected_style]} is ready!**
+
+✨ **Processing completed successfully!**
+
+🖼️ **View your transformed image:**
+{rendered_url}
+
+💡 **Want to try another style?** Send another ImgBB link and choose a different number (1-6)!
+
+🎨 **Chitrify AI** - Transforming memories into art!"""
+                
+                resp.message(final_message)
+                
+                logger.info(f"Successfully processed and sent result for render {pending_render.id}")
                 
             except Exception as e:
-                logger.error(f"Failed to process image: {e}")
+                logger.error(f"Processing failed for render {pending_render.id}: {e}")
+                
+                # Update render status
                 pending_render.status = RenderStatus.FAILED
                 pending_render.error_message = str(e)
                 db.commit()
                 
-                resp.message("❌ Error accessing your image data. Please send the ImgBB link again and try selecting a style.")
+                # ✅ USE SAME METHOD FOR ERROR MESSAGES TOO
+                error_message = """😔 **Image processing encountered an error.**
+
+🔄 **Please try:**
+1. Send your ImgBB link again
+2. Choose a different style (1-6)
+3. Or try with a different image
+
+💬 **Need help?** The error has been logged for our team to investigate."""
+                
+                resp.message(error_message)
+            
+            return Response(str(resp), media_type="application/xml")
+        
+        # Handle status check (optional feature)
+        elif message_body.lower() in ['status', 'check', 'progress']:
+            latest_render = db.query(ImageRender).filter(
+                ImageRender.user_id == user.id
+            ).order_by(ImageRender.created_at.desc()).first()
+            
+            if latest_render:
+                if latest_render.status == RenderStatus.COMPLETED and latest_render.rendered_image_url:
+                    resp.message(f"🎉 **Your latest image is ready!**\n\n🖼️ {latest_render.rendered_image_url}")
+                elif latest_render.status == RenderStatus.PROCESSING:
+                    resp.message("🎨 **Processing in progress...** Please wait a moment.")
+                elif latest_render.status == RenderStatus.FAILED:
+                    resp.message("❌ **Last processing failed.** Please send a new ImgBB link and try again.")
+                else:
+                    resp.message("📋 **Send an ImgBB link to start processing!**")
+            else:
+                resp.message("📋 **No previous renders found.** Send an ImgBB link to get started!")
             
             return Response(str(resp), media_type="application/xml")
         
